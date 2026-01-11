@@ -37,6 +37,9 @@ def compute(db):
         vz = (z - s.prev_z) / dt
     s.prev_z = z
 
+    #vehicle cross section area
+    A = sx * sy
+    
     # Axis-aligned cube assumption (no rotation)
     bottom = z - 0.5 * sz
 
