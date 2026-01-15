@@ -4,11 +4,36 @@ import random
 import omni.usd
 from pxr import PhysxSchema, Gf
 from omni.physx import get_physx_interface
-from omni.isaac.dynamic_control import _dynamic_control
+
+# Dynamic Control for real-time rigid body velocity
+try:
+    from omni.isaac.dynamic_control import _dynamic_control
+    _DC_OK = True
+except Exception:
+    _DC_OK = False
 
 
 def _clamp(x, lo, hi):
     return max(lo, min(hi, x))
+
+
+def _sample_unit_vector_3d(rng: random.Random):
+    """Uniform random direction on a sphere."""
+    u = rng.uniform(-1.0, 1.0)          # cos(theta)
+    phi = rng.uniform(0.0, 2.0 * math.pi)
+    s = math.sqrt(max(0.0, 1.0 - u*u))
+    dx = s * math.cos(phi)
+    dy = s * math.sin(phi)
+    dz = u
+    return dx, dy, dz
+
+
+def _start_new_episode(st):
+    # Random 3D direction for current (fixed during this episode)
+    st.dir_x, st.dir_y, st.dir_z = _sample_unit_vector_3d(st.rng)
+
+    # Reset OU speed state (optional: set to mean, but 0 is ok)
+    st.speed = 0.0
 
 
 def setup(db):
@@ -16,83 +41,82 @@ def setup(db):
 
     st.stage = omni.usd.get_context().get_stage()
     st.physx = get_physx_interface()
-    st.dc = _dynamic_control.acquire_dynamic_control_interface()
 
-    # RNG for direction selection (Pattern A)
-    st.rng = random.Random(int(db.inputs.dir_seed) if hasattr(db.inputs, "dir_seed") else 0)
+    # RNG (Pattern A)
+    seed = int(db.inputs.dir_seed) if hasattr(db.inputs, "dir_seed") else 0
+    st.rng = random.Random(seed)
 
-    # Cached rigid body handle for velocity
-    st.body = st.dc.get_rigid_body(str(db.inputs.prim_path))
+    # Dynamic control init (velocity)
+    st.dc = None
+    st.body = None
+    if _DC_OK:
+        st.dc = _dynamic_control.acquire_dynamic_control_interface()
+        st.body = st.dc.get_rigid_body(str(db.inputs.prim_path))
 
-    # Install/enable PhysxForceAPI on the prim (applies force each step)
-    prim = st.stage.GetPrimAtPath(str(db.inputs.prim_path))
+    # Install/enable ForceAPI on the target prim
+    prim_path = str(db.inputs.prim_path)
+    prim = st.stage.GetPrimAtPath(prim_path)
+    if not prim or not prim.IsValid():
+        db.log_error(f"Invalid prim_path: {prim_path}")
+        st.force_attr = None
+        return
+
     st.force_api = PhysxSchema.PhysxForceAPI.Apply(prim)
     st.force_api.CreateForceEnabledAttr().Set(True)
-    st.force_api.CreateWorldFrameEnabledAttr().Set(True)  # interpret force in world frame
-
+    st.force_api.CreateWorldFrameEnabledAttr().Set(True)
     try:
         st.force_api.CreateModeAttr().Set(PhysxSchema.Tokens.force)
     except Exception:
         st.force_api.CreateModeAttr().Set("force")
-
     st.force_attr = st.force_api.GetForceAttr()
 
-    # Episode state
+    # Episode tracking
     st.prev_time = None
-    st.prev_z = None
     st.speed = 0.0
+    st.dir_x, st.dir_y, st.dir_z = 1.0, 0.0, 0.0
 
-    # Fixed direction for current in XY, sampled per episode
-    st.dir_x = 1.0
-    st.dir_y = 0.0
     _start_new_episode(st)
-
-
-def _start_new_episode(st):
-    # Sample a new fixed direction in XY each episode
-    theta = st.rng.uniform(0.0, 2.0 * math.pi)
-    st.dir_x = math.cos(theta)
-    st.dir_y = math.sin(theta)
-
-    # Reset speed state (optional: start at mean instead)
-    st.speed = 0.0
-    st.prev_z = None
 
 
 def compute(db):
     st = db.internal_state
+    if st.force_attr is None:
+        return
 
-    dt = float(db.inputs.dt)
+    dt = float(db.inputs.dt) if hasattr(db.inputs, "dt") else 0.0
     if dt <= 1e-9:
         return
 
-    sim_time = float(db.inputs.sim_time) if hasattr(db.inputs, "sim_time") else None
-
-    # Detect restart/reset of simulation time -> start a new "episode"
-    if sim_time is not None:
+    # Detect restart: if sim_time goes backward, new episode (new direction)
+    if hasattr(db.inputs, "sim_time"):
+        sim_time = float(db.inputs.sim_time)
         if st.prev_time is not None and sim_time + 1e-6 < st.prev_time:
             _start_new_episode(st)
         st.prev_time = sim_time
 
-    path = str(db.inputs.prim_path)
+    prim_path = str(db.inputs.prim_path)
 
-    # Read rigid body pose from PhysX (real-time)
-    tr = st.physx.get_rigidbody_transformation(path)
+    # --- Position from PhysX (real-time) ---
+    tr = st.physx.get_rigidbody_transformation(prim_path)
     if not tr.get("ret_val", False):
-        db.log_warning(f"No rigidbody transform for {path}. Is this the RigidBody prim?")
+        db.log_warning(f"No rigidbody transform for {prim_path} (is this the RigidBody prim?)")
         return
 
     pos = tr["position"]
+    x = float(pos[0])
+    y = float(pos[1])
     z = float(pos[2])  # assumes Z-up
 
-    # Read rigid body velocity (world) from Dynamic Control
-    # If handle was invalid at setup time, retry once
-    if st.body is None:
-        st.body = st.dc.get_rigid_body(path)
-    v_body = st.dc.get_rigid_body_linear_velocity(st.body)
-    vx_body, vy_body, vz_body = float(v_body[0]), float(v_body[1]), float(v_body[2])
+    # --- Velocity (world) ---
+    vx_body = vy_body = vz_body = 0.0
+    if _DC_OK and st.dc is not None:
+        if st.body is None:
+            st.body = st.dc.get_rigid_body(prim_path)
+        if st.body is not None:
+            v = st.dc.get_rigid_body_linear_velocity(st.body)
+            vx_body, vy_body, vz_body = float(v[0]), float(v[1]), float(v[2])
 
-    # Inputs
+    # --- Inputs ---
     z_water = float(db.inputs.water_surface_z)
     sx = float(db.inputs.size_x)
     sy = float(db.inputs.size_y)
@@ -106,7 +130,7 @@ def compute(db):
     sigma = float(db.inputs.current_sigma)
     tau = float(db.inputs.current_tau)
 
-    # ---------- Submergence & buoyancy (axis-aligned box) ----------
+    # ---------- Buoyancy ----------
     bottom = z - 0.5 * sz
     sub_h = _clamp(z_water - bottom, 0.0, sz)
     submerged_frac = (sub_h / sz) if sz > 1e-9 else 0.0
@@ -115,61 +139,70 @@ def compute(db):
     V_disp = A_xy * sub_h
     F_buoy_z = rho * g * V_disp
 
-    # Vertical water damping (only in water)
-    c_lin_z = 2.0 * rho * A_xy
-    F_drag_z = -c_lin_z * vz_body * submerged_frac
-
-    # ---------- Current model: speed varies, direction fixed in this episode ----------
-    # Ornstein-Uhlenbeck speed process:
-    # dU = -(U-mean)/tau dt + sigma dW
-    # discrete: U += (-(U-mean)/tau)*dt + sigma*sqrt(dt)*N(0,1)
+    # ---------- Current: speed varies, direction fixed (3D) ----------
     tau_safe = max(tau, 1e-6)
+    # OU speed process: U += (-(U-mean)/tau)*dt + sigma*sqrt(dt)*N(0,1)
     st.speed += (-(st.speed - mean) / tau_safe) * dt + sigma * math.sqrt(dt) * st.rng.gauss(0.0, 1.0)
     st.speed = max(0.0, st.speed)
 
-    # Water velocity (horizontal only)
     vx_w = st.speed * st.dir_x
     vy_w = st.speed * st.dir_y
+    vz_w = st.speed * st.dir_z
 
-    # ---------- Horizontal drag from relative velocity ----------
+    # ---------- Drag based on relative velocity (3D) ----------
     vrel_x = vx_body - vx_w
     vrel_y = vy_body - vy_w
-    vrel_mag = math.sqrt(vrel_x * vrel_x + vrel_y * vrel_y)
+    vrel_z = vz_body - vz_w
+    vrel_mag = math.sqrt(vrel_x*vrel_x + vrel_y*vrel_y + vrel_z*vrel_z)
 
-    Fx = 0.0
-    Fy = 0.0
+    Fx = Fy = F_drag_z = 0.0
     if vrel_mag > 1e-6 and submerged_frac > 0.0:
         nx = vrel_x / vrel_mag
         ny = vrel_y / vrel_mag
+        nz = vrel_z / vrel_mag
 
-        # Projected area of a box against flow direction (flow in XY plane)
-        # A_perp ≈ |nx|*(sy*sz) + |ny|*(sx*sz)
-        A_perp = abs(nx) * (sy * sz) + abs(ny) * (sx * sz)
+        # Projected area for an axis-aligned box against flow direction:
+        # faces: +/-X area = sy*sz, +/-Y area = sx*sz, +/-Z area = sx*sy
+        A_perp = abs(nx) * (sy * sz) + abs(ny) * (sx * sz) + abs(nz) * (sx * sy)
 
-        # Quadratic drag:
-        # F = -0.5*rho*Cd*A_perp*|vrel|*vrel
+        # Quadratic drag: F = -0.5*rho*Cd*A_perp*|vrel|*vrel
         drag_scale = 0.5 * rho * Cd * A_perp * submerged_frac
         Fx = -drag_scale * vrel_mag * vrel_x
         Fy = -drag_scale * vrel_mag * vrel_y
+        F_drag_z = -drag_scale * vrel_mag * vrel_z
 
-    # Total force (world frame)
-    Fz = F_buoy_z + F_drag_z
+    # Extra linear damping in Z (helps reduce bobbing); acts only when submerged
+    c_lin_z = 2.0 * rho * A_xy
+    F_lin_z = -c_lin_z * vrel_z * submerged_frac
+
+    # Total force
+    Fz = F_buoy_z + F_drag_z + F_lin_z
     st.force_attr.Set(Gf.Vec3f(float(Fx), float(Fy), float(Fz)))
 
-    # Optional debug outputs
-    if hasattr(db.outputs, "force_x"):
-        db.outputs.force_x = float(Fx)
-    if hasattr(db.outputs, "force_y"):
-        db.outputs.force_y = float(Fy)
-    if hasattr(db.outputs, "force_z"):
-        db.outputs.force_z = float(Fz)
+    # ---------- Outputs ----------
+    # HUD text (2 decimals)
+    hud = (
+        f"z= {z:.2f}\n"
+        f"current speed= {st.speed:.2f} m/s\n"
+        f"current dir= ({st.dir_x:.2f}, {st.dir_y:.2f}, {st.dir_z:.2f})"
+    )
+    if hasattr(db.outputs, "hud_text"):
+        db.outputs.hud_text = hud
+
     if hasattr(db.outputs, "current_speed"):
         db.outputs.current_speed = float(st.speed)
     if hasattr(db.outputs, "current_dir_x"):
         db.outputs.current_dir_x = float(st.dir_x)
     if hasattr(db.outputs, "current_dir_y"):
         db.outputs.current_dir_y = float(st.dir_y)
-    if hasattr(db.outputs, "submerged_height"):
-        db.outputs.submerged_height = float(sub_h)
-    if hasattr(db.outputs, "submerged_fraction"):
-        db.outputs.submerged_fraction = float(submerged_frac)
+    if hasattr(db.outputs, "current_dir_z"):
+        db.outputs.current_dir_z = float(st.dir_z)
+    if hasattr(db.outputs, "z_center"):
+        db.outputs.z_center = float(z)
+
+    if hasattr(db.outputs, "force_x"):
+        db.outputs.force_x = float(Fx)
+    if hasattr(db.outputs, "force_y"):
+        db.outputs.force_y = float(Fy)
+    if hasattr(db.outputs, "force_z"):
+        db.outputs.force_z = float(Fz)
